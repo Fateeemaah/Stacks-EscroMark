@@ -119,3 +119,126 @@
         (ok true)
     )
 )
+
+(define-public (deposit-funds-to-escrow (deposit-amount uint))
+    (begin
+        (asserts! (validate-uint deposit-amount) ERROR-INVALID-INPUT)
+        (try! (stx-transfer? deposit-amount tx-sender (as-contract tx-sender)))
+        (match (map-get? trader-escrow-accounts { trader-address: tx-sender })
+            existing-escrow-account 
+                (map-set trader-escrow-accounts
+                    { trader-address: tx-sender }
+                    { escrow-balance: (+ deposit-amount (get escrow-balance existing-escrow-account)) }
+                )
+            (map-set trader-escrow-accounts
+                { trader-address: tx-sender }
+                { escrow-balance: deposit-amount }
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (withdraw-funds-from-escrow (withdrawal-amount uint))
+    (begin
+        (asserts! (validate-uint withdrawal-amount) ERROR-INVALID-INPUT)
+        (match (map-get? trader-escrow-accounts { trader-address: tx-sender })
+            escrow-account-data
+                (if (>= (get escrow-balance escrow-account-data) withdrawal-amount)
+                    (begin
+                        (try! (as-contract (stx-transfer? withdrawal-amount tx-sender tx-sender)))
+                        (map-set trader-escrow-accounts
+                            { trader-address: tx-sender }
+                            { escrow-balance: (- (get escrow-balance escrow-account-data) withdrawal-amount) }
+                        )
+                        (ok true)
+                    )
+                    ERROR-INSUFFICIENT-ESCROW-BALANCE
+                )
+            ERROR-INSUFFICIENT-ESCROW-BALANCE
+        )
+    )
+)
+
+(define-public (execute-trade (commodity-identifier uint) (trade-quantity uint) (trade-position-id uint))
+    (let (
+        (commodity-data (unwrap! (get-commodity-market-data commodity-identifier) ERROR-INVALID-COMMODITY-PRICE))
+        (current-market-price (get current-market-price commodity-data))
+        (total-trade-cost (* trade-quantity current-market-price))
+    )
+        (begin
+            (asserts! (var-get market-trading-status) ERROR-TRADING-DISABLED)
+            (asserts! (validate-uint commodity-identifier) ERROR-INVALID-INPUT)
+            (asserts! (validate-uint trade-quantity) ERROR-INVALID-INPUT)
+            (asserts! (validate-uint trade-position-id) ERROR-INVALID-INPUT)
+            (try! (validate-trade-parameters trade-quantity current-market-price))
+
+            ;; Check escrow balance
+            (match (map-get? trader-escrow-accounts { trader-address: tx-sender })
+                escrow-account-data
+                    (if (>= (get escrow-balance escrow-account-data) total-trade-cost)
+                        (begin
+                            ;; Update escrow balance
+                            (map-set trader-escrow-accounts
+                                { trader-address: tx-sender }
+                                { escrow-balance: (- (get escrow-balance escrow-account-data) total-trade-cost) }
+                            )
+
+                            ;; Record trading position
+                            (map-set active-trading-positions
+                                { trader-address: tx-sender, trade-position-id: trade-position-id }
+                                {
+                                    commodity-identifier: commodity-identifier,
+                                    traded-quantity: trade-quantity,
+                                    position-entry-price: current-market-price,
+                                    position-creation-timestamp: block-height
+                                }
+                            )
+                            (ok true)
+                        )
+                        ERROR-INSUFFICIENT-ESCROW-BALANCE
+                    )
+                ERROR-INSUFFICIENT-ESCROW-BALANCE
+            )
+        )
+    )
+)
+
+(define-public (close-trading-position (trade-position-id uint))
+    (let (
+        (position-data (unwrap! (get-trader-position-details tx-sender trade-position-id) ERROR-INVALID-TRADE-QUANTITY))
+        (commodity-data (unwrap! (get-commodity-market-data (get commodity-identifier position-data)) ERROR-INVALID-COMMODITY-PRICE))
+        (current-market-price (get current-market-price commodity-data))
+        (position-settlement-amount (* (get traded-quantity position-data) current-market-price))
+    )
+        (begin
+            (asserts! (validate-uint trade-position-id) ERROR-INVALID-INPUT)
+            ;; Return funds to escrow account
+            (match (map-get? trader-escrow-accounts { trader-address: tx-sender })
+                escrow-account-data
+                    (map-set trader-escrow-accounts
+                        { trader-address: tx-sender }
+                        { escrow-balance: (+ (get escrow-balance escrow-account-data) position-settlement-amount) }
+                    )
+                (map-set trader-escrow-accounts
+                    { trader-address: tx-sender }
+                    { escrow-balance: position-settlement-amount }
+                )
+            )
+
+            ;; Delete the position
+            (map-delete active-trading-positions { trader-address: tx-sender, trade-position-id: trade-position-id })
+            (ok true)
+        )
+    )
+)
+
+;; Contract initialization
+(define-public (initialize-contract (administrator-address principal))
+    (begin
+        (asserts! (is-some (some administrator-address)) ERROR-INVALID-INPUT)
+        (var-set contract-administrator administrator-address)
+        (var-set commodity-price-oracle administrator-address)
+        (ok true)
+    )
+)
